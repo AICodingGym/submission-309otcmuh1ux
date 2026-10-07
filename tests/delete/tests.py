@@ -7,7 +7,8 @@ from django.test import TestCase, skipIfDBFeature, skipUnlessDBFeature
 
 from .models import (
     MR, A, Avatar, Base, Child, HiddenUser, HiddenUserProfile, M, M2MFrom,
-    M2MTo, MRNull, Parent, R, RChild, S, T, User, create_a, get_default_r,
+    M2MTo, MRNull, Origin, Parent, R, RChild, Referrer, S, SecondReferrer,
+    SetNullReferrer, T, User, create_a, get_default_r,
 )
 
 
@@ -436,6 +437,71 @@ class DeletionTests(TestCase):
         # One query for the Avatar table and a second for the User one.
         with self.assertNumQueries(2):
             avatar.delete()
+
+    def test_cascade_does_not_load_unreferenced_fields(self):
+        """
+        #30191 - Fields that aren't needed to cascade the deletion aren't
+        loaded, so undecodable data in them can't break delete().
+        """
+        origin = Origin.objects.create()
+        referrer = Referrer.objects.create(origin=origin, unique_field=1, large_field='junk')
+        SecondReferrer.objects.create(referrer=referrer, other_referrer=referrer)
+        Origin.objects.filter(pk=origin.pk).delete()
+        self.assertFalse(Origin.objects.exists())
+        self.assertFalse(Referrer.objects.exists())
+        self.assertFalse(SecondReferrer.objects.exists())
+
+    def test_only_referenced_fields_selected(self):
+        """
+        Only the primary key and fields referenced by other relations (e.g.
+        ForeignKey.to_field) are selected during cascade deletion.
+        """
+        origin = Origin.objects.create()
+        with self.assertNumQueries(2) as ctx:
+            origin.delete()
+        referrer_sql = ctx.captured_queries[0]['sql']
+        quote_name = connection.ops.quote_name
+        self.assertIn(quote_name('id'), referrer_sql)
+        # Referenced by SecondReferrer.other_referrer's to_field.
+        self.assertIn(quote_name('unique_field'), referrer_sql)
+        self.assertNotIn(quote_name('large_field'), referrer_sql)
+
+    def test_set_null_does_not_load_unreferenced_fields(self):
+        """
+        Related objects that aren't referenced by any relation (e.g. only
+        reached through a SET_NULL foreign key) load only their primary key.
+        """
+        origin = Origin.objects.create()
+        referrer = Referrer.objects.create(origin=origin, unique_field=1, large_field='junk')
+        set_null_referrer = SetNullReferrer.objects.create(referrer=referrer, large_field='junk')
+        referrer.delete()
+        self.assertFalse(Referrer.objects.exists())
+        self.assertIsNone(
+            SetNullReferrer.objects.values_list('referrer', flat=True).get(pk=set_null_referrer.pk)
+        )
+
+    def test_all_fields_selected_with_deletion_signals(self):
+        """
+        Deletion signal receivers get fully loaded instances, so all fields
+        are selected when receivers are connected.
+        """
+        def receiver(instance, **kwargs):
+            pass
+
+        for signal_name in ('pre_delete', 'post_delete'):
+            with self.subTest(signal=signal_name):
+                origin = Origin.objects.create()
+                signal = getattr(models.signals, signal_name)
+                signal.connect(receiver, sender=Referrer)
+                try:
+                    with self.assertNumQueries(2) as ctx:
+                        origin.delete()
+                finally:
+                    signal.disconnect(receiver, sender=Referrer)
+                self.assertIn(
+                    connection.ops.quote_name('large_field'),
+                    ctx.captured_queries[0]['sql'],
+                )
 
 
 class FastDeleteTests(TestCase):

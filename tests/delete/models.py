@@ -126,3 +126,33 @@ class Base(models.Model):
 
 class RelToBase(models.Model):
     base = models.ForeignKey(Base, models.DO_NOTHING)
+
+
+class UnloadableTextField(models.TextField):
+    """
+    Simulate a column holding data that can't be decoded when read (#30191).
+    """
+    def from_db_value(self, value, expression, connection):
+        raise AssertionError('%s should not be loaded.' % self.name)
+
+
+class Origin(models.Model):
+    pass
+
+
+class Referrer(models.Model):
+    origin = models.ForeignKey(Origin, models.CASCADE)
+    unique_field = models.IntegerField(unique=True)
+    large_field = UnloadableTextField()
+
+
+class SecondReferrer(models.Model):
+    referrer = models.ForeignKey(Referrer, models.CASCADE)
+    other_referrer = models.ForeignKey(
+        Referrer, models.CASCADE, to_field='unique_field', related_name='+'
+    )
+
+
+class SetNullReferrer(models.Model):
+    referrer = models.ForeignKey(Referrer, models.SET_NULL, null=True)
+    large_field = UnloadableTextField()
